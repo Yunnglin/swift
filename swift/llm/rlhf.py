@@ -137,10 +137,8 @@ def llm_rlhf(args: RLHFArguments) -> Dict[str, Any]:
 
     show_layers(model)
     logger.info(model)
-    model_info = None
-    if not is_deepspeed_zero3_enabled():
-        model_info = get_model_info(model)
-        logger.info(model_info)
+    model_info = get_model_info(model)
+    logger.info(model_info)
 
     if args.gradient_checkpointing:
         model.config.use_cache = False  # fix transformers==4.36
@@ -180,6 +178,8 @@ def llm_rlhf(args: RLHFArguments) -> Dict[str, Any]:
 
     if args.sequence_parallel_size and args.sequence_parallel_size > 1:
         template_kwargs['sequence_parallel_size'] = args.sequence_parallel_size
+
+    template_kwargs['rescale_image'] = args.rescale_image
 
     template: Template = get_template(
         args.template_type, tokenizer, args.system, args.max_length, args.truncation_strategy, model=model)
