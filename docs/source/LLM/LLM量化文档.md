@@ -30,7 +30,7 @@ pip install autoawq -U
 
 # 使用gptq量化:
 # auto_gptq和cuda版本有对应关系，请按照`https://github.com/PanQiWei/AutoGPTQ#quick-installation`选择版本
-pip install auto_gptq -U
+pip install auto_gptq optimum -U
 
 # 使用bnb量化：
 pip install bitsandbytes -U
@@ -41,7 +41,6 @@ pip install hqq
 
 # 使用eetq量化：
 # pip install transformers>=4.41
-
 # 参考https://github.com/NetEase-FuXi/EETQ
 git clone https://github.com/NetEase-FuXi/EETQ.git
 cd EETQ/

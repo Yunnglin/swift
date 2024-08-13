@@ -215,8 +215,9 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
         masks = labels != -100
         acc_strategy = getattr(self.args, 'acc_strategy', 'token')
         acc: Optional[Tensor] = None
-
-        if self.state.global_step % self.sft_args.acc_steps == 0:
+        sft_args = getattr(self, 'sft_args', None)
+        acc_steps = 1 if sft_args is None else sft_args.acc_steps
+        if self.state.global_step % acc_steps == 0:
             if preds.shape != labels.shape:
                 pass
             elif acc_strategy == 'sentence':
@@ -235,6 +236,11 @@ class Seq2SeqTrainer(PushToMsHubMixin, SwiftMixin, HfSeq2SeqTrainer):
                 if 'acc' not in self._custom_metrics:
                     self._custom_metrics['acc'] = self._acc
                 self._custom_metrics['acc'] = self._custom_metrics['acc'] + acc / self.args.gradient_accumulation_steps
+
+        if use_torchacc() and self.args.gradient_accumulation_steps > 1:
+            import torchacc as ta
+            ta.mark_step()
+
         return (loss, outputs) if return_outputs else loss
 
     def get_train_dataloader(self):

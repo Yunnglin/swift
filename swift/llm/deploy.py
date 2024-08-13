@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from http import HTTPStatus
+from threading import Thread
 from typing import List, Optional, Union
 
 import json
@@ -28,7 +29,50 @@ from .utils import (TEMPLATE_MAPPING, ChatCompletionMessageToolCall, ChatComplet
 
 logger = get_logger()
 
-app = FastAPI()
+global_stats = {}
+default_global_stats = {
+    'num_prompt_tokens': 0,
+    'num_generated_tokens': 0,
+    'num_samples': 0,
+    'runtime': 0.,
+    'samples/s': 0.,
+    'tokens/s': 0.
+}
+
+
+async def _log_stats_hook(log_interval: int):
+    global global_stats
+    while True:
+        global_stats = default_global_stats.copy()
+        t = time.perf_counter()
+        await asyncio.sleep(log_interval)
+        runtime = time.perf_counter() - t
+        global_stats['runtime'] = runtime
+        global_stats['samples/s'] = global_stats['num_samples'] / runtime
+        global_stats['tokens/s'] = global_stats['num_generated_tokens'] / runtime
+        for k, v in global_stats.items():
+            global_stats[k] = round(v, 8)
+        logger.info(global_stats)
+
+
+def _update_stats(response) -> None:
+    if response is None:
+        return
+    usage_info = response.usage
+    global_stats['num_prompt_tokens'] += usage_info.prompt_tokens
+    global_stats['num_generated_tokens'] += usage_info.completion_tokens
+    global_stats['num_samples'] += 1
+
+
+def lifespan(app: FastAPI):
+    global _args
+    if _args.log_interval > 0:
+        thread = Thread(target=lambda: asyncio.run(_log_stats_hook(_args.log_interval)))
+        thread.start()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 _args: Optional[DeployArguments] = None
 model = None
 llm_engine = None
@@ -113,23 +157,19 @@ async def _prepare_request(request: Union[ChatCompletionRequest, CompletionReque
         seed_everything(request.seed, verbose=False)
     _request = {'model': request.model}
     if isinstance(request, ChatCompletionRequest):
-        if is_generation_template(template.template_type):
+        if is_generation_template(
+                template.template_type) and not (len(request.messages) == 1 and request.messages[0]['role'] == 'user'):
             return create_error_response(
                 HTTPStatus.BAD_REQUEST, f'The chat template `{template.template_type}` corresponding to '
                 f'the model `{model_or_engine.model_type}` is in text generation format. '
                 'Please use the `completions` API.')
         messages = request.messages
-        images = request.images
         if _args.is_multimodal:
-            compat_openai(messages, images, template.template_type)
+            compat_openai(messages, request)
             messages = decode_base64(messages=messages)['messages']
-            images = decode_base64(images=images)['images']
         # For agent, check if response is endwith observations and join tool observation
         messages_join_observation(messages)
         example = messages_to_history(messages)
-        if len(images) > 0:
-            example['images'] = images
-
         if request.tool_choice is not None and request.tools is not None:
             if isinstance(request.tool_choice, dict):
                 name = request.tool_choice['function']['name']
@@ -139,9 +179,6 @@ async def _prepare_request(request: Union[ChatCompletionRequest, CompletionReque
                 example['tools'] = [tool]
             elif request.tool_choice == 'auto':
                 example['tools'] = request.tools
-        executor = ThreadPoolExecutor(max_workers=1)
-        loop = asyncio.get_running_loop()
-        inputs = (await loop.run_in_executor(executor, template.encode, example))[0]
         request_id = f'chatcmpl-{random_uuid()}'
         _request['messages'] = messages
     else:
@@ -151,19 +188,19 @@ async def _prepare_request(request: Union[ChatCompletionRequest, CompletionReque
                 f'the model `{model_or_engine.model_type}` is in chat format. '
                 'Please use the `chat.completions` API.')
         prompt = request.prompt
-        images = request.images
         if _args.is_multimodal:
             prompt = decode_base64(prompt=prompt)['prompt']
-            images = decode_base64(images=images)['images']
         example = {'query': prompt}
-        if len(images) > 0:
-            example['images'] = images
-        executor = ThreadPoolExecutor(max_workers=1)
-        loop = asyncio.get_running_loop()
-        inputs = (await loop.run_in_executor(executor, template.encode, example))[0]
         request_id = f'cmpl-{random_uuid()}'
         _request['prompt'] = prompt
 
+    for media_key in ['images', 'audios', 'videos']:
+        medias = getattr(request, media_key, None)
+        if medias:
+            example[media_key] = medias
+    executor = ThreadPoolExecutor(max_workers=1)
+    loop = asyncio.get_running_loop()
+    inputs = (await loop.run_in_executor(executor, template.encode, example))[0]
     request_info = {'request_id': request_id}
     request_info.update(_request)
 
@@ -199,6 +236,7 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
         else:
             kwargs[key] = new_value
     kwargs['stop'] = (llm_engine.generation_config.stop or []) + (getattr(request, 'stop') or [])
+    kwargs['seed'] = request.seed
 
     generation_config = VllmGenerationConfig(**kwargs)
     if generation_config.use_beam_search and request.stream:
@@ -214,8 +252,9 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
         if token_str not in generation_config.stop:
             generation_config.stop.append(token_str)
     request_info['generation_config'] = generation_config
-    request_info.update({'seed': request.seed, 'stream': request.stream})
-    logger.info(request_info)
+    request_info.update({'stream': request.stream})
+    if _args.verbose:
+        logger.info(request_info)
 
     generate_kwargs = {}
     if _args.vllm_enable_lora and request.model != _args.model_type:
@@ -228,13 +267,15 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
         generate_kwargs['lora_request'] = lora_request
 
     import vllm
-    from .utils.vllm_utils import _prepare_request_inputs
-
+    input_ids = inputs['input_ids']
     if version.parse(vllm.__version__) >= version.parse('0.4.3'):
-        request_inputs = _prepare_request_inputs(inputs)
-        result_generator = llm_engine.generate(request_inputs, generation_config, request_id, **generate_kwargs)
+        llm_inputs = {'prompt_token_ids': input_ids}
+        images = inputs.get('images') or []
+        if images:
+            assert len(images) == 1, 'Currently, only one image is supported.'
+            llm_inputs['multi_modal_data'] = {'image': images[0]}
+        result_generator = llm_engine.generate(llm_inputs, generation_config, request_id, **generate_kwargs)
     else:
-        input_ids = inputs['input_ids']
         result_generator = llm_engine.generate(None, generation_config, request_id, input_ids, **generate_kwargs)
 
     async def _generate_full():
@@ -259,10 +300,12 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
                 action, action_input = split_action_action_input(response)
                 toolcall = None
                 if action is not None:
-                    toolcall = ChatCompletionMessageToolCall(
-                        id=f'toolcall-{random_uuid()}',
-                        type='function',
-                        function=Function(name=action, arguments=action_input))
+                    toolcall = [
+                        ChatCompletionMessageToolCall(
+                            id=f'toolcall-{random_uuid()}',
+                            type='function',
+                            function=Function(name=action, arguments=action_input))
+                    ]
                 choice = ChatCompletionResponseChoice(
                     index=output.index,
                     message=ChatMessage(role='assistant', content=response, tool_calls=toolcall),
@@ -283,11 +326,14 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
                 choices.append(choice)
             response = CompletionResponse(
                 model=request.model, choices=choices, usage=usage_info, id=request_id, created=created_time)
+        if _args.log_interval > 0:
+            _update_stats(response)
         return response
 
     async def _generate_stream():
         print_idx_list = [[0] for _ in range(request.n)]
         total_res = ['' for _ in range(request.n)]
+        response = None
         async for result in result_generator:
             num_prompt_tokens = len(result.prompt_token_ids)
             num_generated_tokens = sum(len(output.token_ids) for output in result.outputs)
@@ -307,10 +353,12 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
                     if output.finish_reason is not None:
                         action, action_input = split_action_action_input(total_res[output.index])
                         if action is not None:
-                            toolcall = ChatCompletionMessageToolCall(
-                                id=f'toolcall-{random_uuid()}',
-                                type='function',
-                                function=Function(name=action, arguments=action_input))
+                            toolcall = [
+                                ChatCompletionMessageToolCall(
+                                    id=f'toolcall-{random_uuid()}',
+                                    type='function',
+                                    function=Function(name=action, arguments=action_input))
+                            ]
                     choice = ChatCompletionResponseStreamChoice(
                         index=output.index,
                         delta=DeltaMessage(role='assistant', content=output.delta_text, tool_calls=toolcall),
@@ -327,6 +375,8 @@ async def inference_vllm_async(request: Union[ChatCompletionRequest, CompletionR
                 response = CompletionStreamResponse(
                     model=request.model, choices=choices, usage=usage_info, id=request_id, created=created_time)
             yield f'data:{json.dumps(asdict(response), ensure_ascii=False)}\n\n'
+        if _args.log_interval > 0:
+            _update_stats(response)
         yield 'data:[DONE]\n\n'
 
     if request.stream:
@@ -363,22 +413,25 @@ async def inference_lmdeploy_async(request: Union[ChatCompletionRequest, Complet
     _add_stop_word(stop_words, tokenizer.eos_token_id, tokenizer=tokenizer)
     _add_stop_word(stop_words, template.suffix[-1], tokenizer=tokenizer)
     kwargs['stop_words'] = stop_words
+    kwargs['random_seed'] = request.seed
 
     generation_config = LmdeployGenerationConfig(**kwargs)
     request_info['generation_config'] = generation_config
-    request_info.update({'seed': request.seed, 'stream': request.stream})
-    logger.info(request_info)
+    request_info.update({'stream': request.stream})
+    if _args.verbose:
+        logger.info(request_info)
 
-    generator = await llm_engine.get_generator(False, created_time)
+    session_id = time.time_ns()
+    generator = await llm_engine.get_generator(False, session_id)
     images = inputs.pop('images', None) or []
     if len(images) > 0:
         inputs['images'] = await llm_engine.vl_encoder.async_infer(images)
         await template.prepare_lmdeploy_inputs(inputs)
 
     async def _generate_full():
-        async with llm_engine.safe_run(created_time):
+        async with llm_engine.safe_run(session_id):
             async for output in generator.async_stream_infer(
-                    session_id=created_time, **inputs, stream_output=False, gen_config=generation_config):
+                    session_id=session_id, **inputs, stream_output=False, gen_config=generation_config):
                 pass
         response = template.generate_ids_to_response(output.token_ids)
         num_prompt_tokens = len(inputs['input_ids'])
@@ -396,10 +449,12 @@ async def inference_lmdeploy_async(request: Union[ChatCompletionRequest, Complet
             action, action_input = split_action_action_input(response)
             toolcall = None
             if action is not None:
-                toolcall = ChatCompletionMessageToolCall(
-                    id=f'toolcall-{random_uuid()}',
-                    type='function',
-                    function=Function(name=action, arguments=action_input))
+                toolcall = [
+                    ChatCompletionMessageToolCall(
+                        id=f'toolcall-{random_uuid()}',
+                        type='function',
+                        function=Function(name=action, arguments=action_input))
+                ]
             choices = [
                 ChatCompletionResponseChoice(
                     index=0,
@@ -417,16 +472,19 @@ async def inference_lmdeploy_async(request: Union[ChatCompletionRequest, Complet
             )]
             response = CompletionResponse(
                 model=request.model, choices=choices, usage=usage_info, id=request_id, created=created_time)
+        if _args.log_interval > 0:
+            _update_stats(response)
         return response
 
     async def _generate_stream():
         num_prompt_tokens = len(inputs['input_ids'])
         total_response = ''
         print_idx = [0]
-        async with llm_engine.safe_run(created_time):
+        async with llm_engine.safe_run(session_id):
             async_iter = generator.async_stream_infer(
-                session_id=created_time, **inputs, stream_output=True, gen_config=generation_config).__aiter__()
+                session_id=session_id, **inputs, stream_output=True, gen_config=generation_config).__aiter__()
             is_finished = False
+            response = None
             while not is_finished:
                 try:
                     output = await async_iter.__anext__()
@@ -451,10 +509,12 @@ async def inference_lmdeploy_async(request: Union[ChatCompletionRequest, Complet
                     if finish_reason == 'stop':
                         action, action_input = split_action_action_input(total_response)
                         if action is not None:
-                            toolcall = ChatCompletionMessageToolCall(
-                                id=f'toolcall-{random_uuid()}',
-                                type='function',
-                                function=Function(name=action, arguments=action_input))
+                            toolcall = [
+                                ChatCompletionMessageToolCall(
+                                    id=f'toolcall-{random_uuid()}',
+                                    type='function',
+                                    function=Function(name=action, arguments=action_input))
+                            ]
                     choices = [
                         ChatCompletionResponseStreamChoice(
                             index=0,
@@ -468,6 +528,8 @@ async def inference_lmdeploy_async(request: Union[ChatCompletionRequest, Complet
                     response = CompletionStreamResponse(
                         model=request.model, choices=choices, usage=usage_info, id=request_id, created=created_time)
                 yield f'data:{json.dumps(asdict(response), ensure_ascii=False)}\n\n'
+            if _args.log_interval > 0:
+                _update_stats(response)
             yield 'data:[DONE]\n\n'
 
     if request.stream:
@@ -539,7 +601,8 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
     request_info['generation_config'] = generation_config
     stop = (_args.stop_words or []) + (getattr(request, 'stop') or [])
     request_info.update({'seed': request.seed, 'stop': stop, 'stream': request.stream})
-    logger.info(request_info)
+    if _args.verbose:
+        logger.info(request_info)
 
     adapter_kwargs = {}
     if _args.lora_request_list is not None:
@@ -575,10 +638,12 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
             action, action_input = split_action_action_input(response)
             toolcall = None
             if action is not None:
-                toolcall = ChatCompletionMessageToolCall(
-                    id=f'toolcall-{random_uuid()}',
-                    type='function',
-                    function=Function(name=action, arguments=action_input))
+                toolcall = [
+                    ChatCompletionMessageToolCall(
+                        id=f'toolcall-{random_uuid()}',
+                        type='function',
+                        function=Function(name=action, arguments=action_input))
+                ]
             choices = [
                 ChatCompletionResponseChoice(
                     index=0,
@@ -596,6 +661,8 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
             )]
             response = CompletionResponse(
                 model=request.model, choices=choices, usage=usage_info, id=request_id, created=created_time)
+        if _args.log_interval > 0:
+            _update_stats(response)
         return response
 
     def _generate_stream():
@@ -612,6 +679,7 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
         print_idx = 0
         response = ''
         is_finished = False
+        resp = None
         while not is_finished:
             try:
                 response, _ = next(gen)
@@ -631,10 +699,12 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
                 if is_finished:
                     action, action_input = split_action_action_input(response)
                     if action:
-                        toolcall = ChatCompletionMessageToolCall(
-                            id=f'toolcall-{random_uuid()}',
-                            type='function',
-                            function=Function(name=action, arguments=action_input))
+                        toolcall = [
+                            ChatCompletionMessageToolCall(
+                                id=f'toolcall-{random_uuid()}',
+                                type='function',
+                                function=Function(name=action, arguments=action_input))
+                        ]
                 choices = [
                     ChatCompletionResponseStreamChoice(
                         index=0,
@@ -650,6 +720,8 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
                 resp = CompletionStreamResponse(
                     model=request.model, choices=choices, usage=usage_info, id=request_id, created=created_time)
             yield f'data:{json.dumps(asdict(resp), ensure_ascii=False)}\n\n'
+        if _args.log_interval > 0:
+            _update_stats(resp)
         yield 'data:[DONE]\n\n'
 
     if request.stream:
@@ -659,7 +731,7 @@ async def inference_pt_async(request: Union[ChatCompletionRequest, CompletionReq
 
 
 @app.post('/v1/chat/completions')
-async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request) -> ChatCompletionResponse:
+async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     global _args
     assert _args is not None
     if request.stop is None:
@@ -673,7 +745,7 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
 
 
 @app.post('/v1/completions')
-async def create_completion(request: CompletionRequest, raw_request: Request) -> CompletionResponse:
+async def create_completion(request: CompletionRequest, raw_request: Request):
     global _args
     assert _args is not None
     if request.stop is None:

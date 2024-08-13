@@ -14,7 +14,7 @@ from requests.exceptions import HTTPError
 
 from .protocol import (ChatCompletionResponse, ChatCompletionStreamResponse, CompletionResponse,
                        CompletionStreamResponse, ModelList, XRequestConfig)
-from .template import TEMPLATE_MAPPING, History
+from .template import History
 from .utils import Messages, history_to_messages
 
 
@@ -31,6 +31,21 @@ def get_model_list_client(host: str = '127.0.0.1', port: str = '8000', api_key: 
     url = url.rstrip('/')
     url = f'{url}/models'
     resp_obj = requests.get(url, **_get_request_kwargs(api_key)).json()
+    return from_dict(ModelList, resp_obj)
+
+
+async def get_model_list_client_async(host: str = '127.0.0.1',
+                                      port: str = '8000',
+                                      api_key: str = 'EMPTY',
+                                      **kwargs) -> ModelList:
+    url = kwargs.pop('url', None)
+    if url is None:
+        url = f'http://{host}:{port}/v1'
+    url = url.rstrip('/')
+    url = f'{url}/models'
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, **_get_request_kwargs(api_key)) as resp:
+            resp_obj = await resp.json()
     return from_dict(ModelList, resp_obj)
 
 
@@ -143,8 +158,7 @@ def decode_base64(*,
     return res
 
 
-def compat_openai(messages: Messages, images: List[str], template_type: str) -> None:
-    infer_media_type = TEMPLATE_MAPPING[template_type].get('infer_media_type', 'interleave')
+def compat_openai(messages: Messages, request) -> None:
     for message in messages:
         content = message['content']
         if isinstance(content, list):
@@ -154,16 +168,21 @@ def compat_openai(messages: Messages, images: List[str], template_type: str) -> 
                 value = line[_type]
                 if _type == 'text':
                     text += value
-                elif _type == 'image_url':
+                elif _type in {'image_url', 'audio_url', 'video_url'}:
                     value = value['url']
                     if value.startswith('data:'):
                         match_ = re.match(r'data:(.+?);base64,(.+)', value)
                         assert match_ is not None
                         value = match_.group(2)
-                    if infer_media_type == 'interleave':
-                        text += f'<img>{value}</img>'
+                    if _type == 'image_url':
+                        text += '<image>'
+                        request.images.append(value)
+                    elif _type == 'audio_url':
+                        text += '<audio>'
+                        request.audios.append(value)
                     else:
-                        images.append(value)
+                        text += '<video>'
+                        request.videos.append(value)
                 else:
                     raise ValueError(f'line: {line}')
             message['content'] = text
@@ -177,27 +196,24 @@ def _pre_inference_client(model_type: str,
                           tools: Optional[List[Dict[str, Union[str, Dict]]]] = None,
                           tool_choice: Optional[Union[str, Dict]] = 'auto',
                           *,
+                          model_list: Optional[ModelList] = None,
                           is_chat_request: Optional[bool] = None,
+                          is_multimodal: Optional[bool] = None,
                           request_config: Optional[XRequestConfig] = None,
                           host: str = '127.0.0.1',
                           port: str = '8000',
-                          api_key: str = 'EMPTY',
                           **kwargs) -> Tuple[str, Dict[str, Any], bool]:
-    if images is None:
-        images = []
-    model_list = get_model_list_client(host, port, **kwargs)
-    for model in model_list.data:
-        if model_type == model.id:
-            _is_chat = model.is_chat
-            is_multimodal = model.is_multimodal
-            break
-    else:
-        raise ValueError(f'model_type: {model_type}, model_list: {[model.id for model in model_list.data]}')
-
-    if is_chat_request is None:
-        is_chat_request = _is_chat
-    assert is_chat_request is not None, (
-        'Please set the `is_chat_request` parameter to indicate whether the model is a chat model.')
+    if model_list is not None:
+        for model in model_list.data:
+            if model_type == model.id:
+                if is_chat_request is None:
+                    is_chat_request = model.is_chat
+                if is_multimodal is None:
+                    is_multimodal = model.is_multimodal
+                break
+        else:
+            raise ValueError(f'model_type: {model_type}, model_list: {[model.id for model in model_list.data]}')
+    assert is_chat_request is not None and is_multimodal is not None
     data = {k: v for k, v in request_config.__dict__.items() if not k.startswith('__')}
     url = kwargs.pop('url', None)
     if url is None:
@@ -207,7 +223,6 @@ def _pre_inference_client(model_type: str,
         messages = history_to_messages(history, query, system, kwargs.get('roles'))
         if is_multimodal:
             messages = convert_to_base64(messages=messages)['messages']
-            images = convert_to_base64(images=images)['images']
         data['messages'] = messages
         url = f'{url}/chat/completions'
     else:
@@ -215,12 +230,13 @@ def _pre_inference_client(model_type: str,
             'The chat template for text generation does not support system and history.')
         if is_multimodal:
             query = convert_to_base64(prompt=query)['prompt']
-            images = convert_to_base64(images=images)['images']
         data['prompt'] = query
         url = f'{url}/completions'
     data['model'] = model_type
-    if len(images) > 0:
-        data['images'] = images
+    for media_key, medias in zip(['images', 'audios', 'videos'], [images, kwargs.get('audios'), kwargs.get('videos')]):
+        if medias:
+            medias = convert_to_base64(images=medias)['images']
+            data[media_key] = medias
     if tools and len(tools) > 0:
         data['tools'] = tools
     if tool_choice:
@@ -238,6 +254,7 @@ def inference_client(
     tool_choice: Optional[Union[str, Dict]] = 'auto',
     *,
     is_chat_request: Optional[bool] = None,
+    is_multimodal: Optional[bool] = None,
     request_config: Optional[XRequestConfig] = None,
     host: str = '127.0.0.1',
     port: str = '8000',
@@ -247,6 +264,10 @@ def inference_client(
            Iterator[CompletionStreamResponse]]:
     if request_config is None:
         request_config = XRequestConfig()
+    model_list = None
+    if is_chat_request is None or is_multimodal is None:
+        model_list = get_model_list_client(host, port, api_key=api_key, **kwargs)
+
     url, data, is_chat_request = _pre_inference_client(
         model_type,
         query,
@@ -255,11 +276,12 @@ def inference_client(
         images,
         tools,
         tool_choice,
+        model_list=model_list,
         is_chat_request=is_chat_request,
+        is_multimodal=is_multimodal,
         request_config=request_config,
         host=host,
         port=port,
-        api_key=api_key,
         **kwargs)
 
     if request_config.stream:
@@ -302,6 +324,7 @@ async def inference_client_async(
     tool_choice: Optional[Union[str, Dict]] = 'auto',
     *,
     is_chat_request: Optional[bool] = None,
+    is_multimodal: Optional[bool] = None,
     request_config: Optional[XRequestConfig] = None,
     host: str = '127.0.0.1',
     port: str = '8000',
@@ -311,6 +334,10 @@ async def inference_client_async(
            AsyncIterator[CompletionStreamResponse]]:
     if request_config is None:
         request_config = XRequestConfig()
+    model_list = None
+    if is_chat_request is None or is_multimodal is None:
+        model_list = await get_model_list_client_async(host, port, api_key=api_key, **kwargs)
+
     url, data, is_chat_request = _pre_inference_client(
         model_type,
         query,
@@ -319,11 +346,12 @@ async def inference_client_async(
         images,
         tools,
         tool_choice,
+        model_list=model_list,
         is_chat_request=is_chat_request,
+        is_multimodal=is_multimodal,
         request_config=request_config,
         host=host,
         port=port,
-        api_key=api_key,
         **kwargs)
 
     if request_config.stream:

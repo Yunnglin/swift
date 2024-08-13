@@ -378,6 +378,7 @@ class SwiftMixin:
         # model
         supported_classes = (SwiftModel, PreTrainedModel, PeftModel)
         save_safetensors = self.args.save_safetensors
+
         if not isinstance(self.model, supported_classes):
             if state_dict is None:
                 state_dict = self.model.state_dict()
@@ -418,6 +419,21 @@ class SwiftMixin:
 
     def _save_checkpoint(self, model, trial, metrics=None):
         self.state.last_model_checkpoint = os.path.join(self.args.output_dir, f'checkpoint-{self.state.global_step}')
+        if is_deepspeed_zero3_enabled() and not hasattr(self.deepspeed, '_zero3_consolidated_16bit_state_dict_origin'):
+
+            def _zero3_consolidated_16bit_state_dict(_model, exclude_frozen_parameters=False):
+                unwrapped = unwrap_model(_model)
+                exclude_frozen_parameters = False
+                if isinstance(unwrapped, SwiftModel) and unwrapped.has_additional_modules:
+                    exclude_frozen_parameters = True
+                if isinstance(unwrapped, PeftModel):
+                    exclude_frozen_parameters = True
+                return _model._zero3_consolidated_16bit_state_dict_origin(exclude_frozen_parameters)
+
+            self.deepspeed._zero3_consolidated_16bit_state_dict_origin = (
+                self.deepspeed._zero3_consolidated_16bit_state_dict)
+            self.deepspeed._zero3_consolidated_16bit_state_dict = MethodType(_zero3_consolidated_16bit_state_dict,
+                                                                             self.deepspeed)
         if version.parse(transformers.__version__) >= version.parse('4.36') or not self.args.save_only_model:
             result = super()._save_checkpoint(model, trial, metrics)
         else:
@@ -575,7 +591,9 @@ class SwiftMixin:
                     self._total_loss_scalar += v_scalar
                 logs[k] = round(v_scalar / (self.state.global_step - self._globalstep_last_logged), 8)
                 if k == 'acc' and self._globalstep_last_logged > 0:
-                    logs[k] *= self.sft_args.acc_steps
+                    sft_args = getattr(self, 'sft_args', None)
+                    acc_steps = 1 if sft_args is None else sft_args.acc_steps
+                    logs[k] *= acc_steps
             if version.parse(transformers.__version__) >= version.parse('4.38'):
                 grad_norm = args[0]
                 if isinstance(grad_norm, torch.Tensor):

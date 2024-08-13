@@ -3,8 +3,8 @@ import concurrent.futures
 import inspect
 import os
 import time
-from contextlib import contextmanager
 from copy import deepcopy
+from functools import wraps
 from queue import Queue
 from threading import Thread
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
@@ -16,7 +16,7 @@ from lmdeploy.api import autoget_backend_config
 from lmdeploy.serve.async_engine import AsyncEngine
 from lmdeploy.serve.vl_async_engine import VLAsyncEngine
 from tqdm import tqdm
-from transformers import AutoConfig, GenerationConfig
+from transformers import AutoConfig, AutoTokenizer, GenerationConfig
 
 from swift.utils import get_logger
 from .argument import InferArguments
@@ -69,7 +69,16 @@ def get_lmdeploy_engine(
         pipeline_kwargs['vision_config'] = vision_config
         logger.info(f'vision_config: {vision_config}')
 
+    _old_from_pretrained = AutoTokenizer.from_pretrained
+
+    @wraps(_old_from_pretrained)
+    def _from_pretrained(self, *args, **kwargs):
+        return tokenizer
+
+    AutoTokenizer.from_pretrained = _from_pretrained
     lmdeploy_engine = pipeline(model_dir, backend_config=backend_config, **pipeline_kwargs)
+    AutoTokenizer.from_pretrained = _old_from_pretrained  # recover
+
     lmdeploy_engine.model_dir = model_dir
     lmdeploy_engine.model_type = model_type
     lmdeploy_engine.is_multimodal = is_multimodal
@@ -92,13 +101,6 @@ def get_lmdeploy_engine(
     return lmdeploy_engine
 
 
-@contextmanager
-def lmdeploy_context(self: Template):
-    self._is_lmdeploy = True
-    yield
-    self._is_lmdeploy = False
-
-
 class LmdeployGenerationConfig(_LmdeployGenerationConfig):
 
     def __init__(
@@ -111,6 +113,7 @@ class LmdeployGenerationConfig(_LmdeployGenerationConfig):
         *,
         n: int = 1,
         stop_words: Optional[List[int]] = None,
+        random_seed: Optional[int] = None,
         skip_special_tokens: bool = False,
         **kwargs,
     ) -> None:
@@ -124,6 +127,7 @@ class LmdeployGenerationConfig(_LmdeployGenerationConfig):
             repetition_penalty=repetition_penalty,
             n=n,
             stop_words=stop_words,
+            random_seed=random_seed,
             skip_special_tokens=skip_special_tokens,
             **kwargs)
 
@@ -150,7 +154,8 @@ def _prepare_lmdeploy_request(lmdeploy_engine: Union[AsyncEngine, VLAsyncEngine]
                               use_tqdm: bool = False,
                               **kwargs):
     for key in ['num_prompt_tokens', 'num_generated_tokens', 'num_samples']:
-        generation_info[key] = 0
+        if key not in generation_info:
+            generation_info[key] = 0
 
     if hasattr(lmdeploy_engine, 'vl_encoder'):
         lmdeploy_engine.vl_encoder._loop_task = None
@@ -177,7 +182,7 @@ def _prepare_lmdeploy_request(lmdeploy_engine: Union[AsyncEngine, VLAsyncEngine]
         prog_bar.update()
         return inputs
 
-    with lmdeploy_context(template), concurrent.futures.ThreadPoolExecutor(
+    with template.lmdeploy_context(), concurrent.futures.ThreadPoolExecutor(
             max_workers=min(max_workers, len(request_list))) as executor:
         futures = [executor.submit(_prepare_inputs, request) for request in request_list]
         concurrent.futures.wait(futures)
@@ -206,6 +211,10 @@ def inference_stream_lmdeploy(lmdeploy_engine: Union[AsyncEngine, VLAsyncEngine]
                               generation_info: Optional[Dict[str, Any]] = None,
                               use_tqdm: bool = False,
                               **kwargs) -> Iterator[List[Dict[str, Any]]]:
+    """
+    request_list: e.g. [{'query': 'hello!'}].
+        The keys that can be included are: 'query', 'history', 'system', 'images'.
+    """
     if len(request_list) == 0:
         return
     start_runtime = time.perf_counter()
@@ -291,23 +300,58 @@ def inference_lmdeploy(lmdeploy_engine: Union[AsyncEngine, VLAsyncEngine],
                        *,
                        generation_config: Optional[LmdeployGenerationConfig] = None,
                        generation_info: Optional[Dict[str, Any]] = None,
+                       max_batch_size: Optional[int] = None,
                        use_tqdm: bool = False,
                        verbose: bool = False,
                        prompt_prefix: str = '[PROMPT]',
                        output_prefix: str = '[OUTPUT]',
                        **kwargs) -> List[Dict[str, Any]]:
+    """
+    request_list: e.g. [{'query': 'hello!'}].
+        The keys that can be included are: 'query', 'history', 'system', 'images'.
+    """
     if len(request_list) == 0:
         return []
     runtime = time.perf_counter()
+
+    is_multimodal = getattr(lmdeploy_engine, 'is_multimodal', False)
+    if is_multimodal and max_batch_size is None:
+        max_batch_size = 512
+
+    _inner_call = kwargs.get('_inner_call', False)
+    if generation_info is None:
+        generation_info = {}
+    elif not _inner_call:
+        generation_info.clear()
+    if max_batch_size is not None and len(request_list) > max_batch_size:
+        i = 0
+        resp_list = []
+        kwargs['_inner_call'] = True
+        while i < len(request_list):
+            resp_list += inference_lmdeploy(
+                lmdeploy_engine,
+                template,
+                request_list[i:i + max_batch_size],
+                generation_config=generation_config,
+                generation_info=generation_info,
+                max_batch_size=max_batch_size,
+                use_tqdm=use_tqdm,
+                verbose=verbose,
+                prompt_prefix=prompt_prefix,
+                output_prefix=output_prefix,
+                **kwargs)
+            i += max_batch_size
+        runtime = time.perf_counter() - runtime
+        generation_info['runtime'] = runtime
+        generation_info['samples/s'] = generation_info['num_samples'] / runtime
+        generation_info['tokens/s'] = generation_info['num_generated_tokens'] / runtime
+        return resp_list
+
     if generation_config is None:
         generation_config = getattr(lmdeploy_engine, 'generation_config', LmdeployGenerationConfig())
     assert isinstance(generation_config, LmdeployGenerationConfig)
     request_list = deepcopy(request_list)
     generation_config = deepcopy(generation_config)
-    if generation_info is None:
-        generation_info = {}
-    else:
-        generation_info.clear()
 
     resp_list, generators = _prepare_lmdeploy_request(
         lmdeploy_engine,
@@ -356,7 +400,7 @@ def inference_lmdeploy(lmdeploy_engine: Union[AsyncEngine, VLAsyncEngine],
     prog_bar.close()
     runtime = time.perf_counter() - runtime
     generation_info['runtime'] = runtime
-    generation_info['samples/s'] = len(generators) / runtime
+    generation_info['samples/s'] = generation_info['num_samples'] / runtime
     generation_info['tokens/s'] = generation_info['num_generated_tokens'] / runtime
     return resp_list
 
